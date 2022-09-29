@@ -81,7 +81,6 @@ def demo():
         b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
-
     ###
     # Mint pool tokens
     ###
@@ -166,6 +165,7 @@ def create_asset(addr, pk, unitname):
 def print_balances(app_id: int, app: str, addr: str, pool: int, a: int, b: int):
 
     addrbal = client.account_info(addr)
+    print("print_balances ==========>")
     print("Participant: ")
     for asset in addrbal["assets"]:
         if asset["asset-id"] == pool:
@@ -204,6 +204,8 @@ def print_balances(app_id: int, app: str, addr: str, pool: int, a: int, b: int):
         )  # TODO: dont hardcode the scale
     else:
         print("\tNo ratio a/b")
+
+    print("print_balances <==========")
 
 
 if __name__ == "__main__":

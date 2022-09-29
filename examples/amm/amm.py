@@ -78,9 +78,10 @@ class ConstantProductAMM(Application):
         """bootstraps the contract by opting into the assets and creating the pool token"""
         well_formed_bootstrap = And(
             Global.group_size() == Int(1),
-            a_asset.asset_id() < b_asset.asset_id(),
+            a_asset.asset_id() < b_asset.asset_id(), # Request for clarification:  What motivates requiring ordering of asset IDs?
         )
 
+        # Requirements:  Is it correct to allow repeated `bootstrap` invocations that duplicate pool creation + opt-in?
         return Seq(
             Assert(well_formed_bootstrap),
             ConstantProductAMM.asset_a.set(a_asset.asset_id()),
@@ -100,7 +101,7 @@ class ConstantProductAMM(Application):
     # AMM specific methods for mint/burn/swap
     ##############
 
-    @handler
+    @handler # Visual reminder to circle back:  What is the allowed set of on-complete calls?
     def mint(
         a_xfer: abi.AssetTransferTransaction,
         b_xfer: abi.AssetTransferTransaction,
@@ -156,7 +157,7 @@ class ConstantProductAMM(Application):
                     ),
                     # Normal mint
                     ConstantProductAMM.tokens_to_mint(
-                        ConstantProductAMM.total_supply - pool_bal.value(),
+                        ConstantProductAMM.total_supply - pool_bal.value(), # Is it safe to omit underflow check?
                         a_bal.value(),
                         b_bal.value(),
                         a_xfer.get().asset_amount(),
@@ -199,7 +200,7 @@ class ConstantProductAMM(Application):
             # Get the total number of tokens issued (prior to receiving the current axfer of pool tokens)
             (issued := ScratchVar()).store(
                 ConstantProductAMM.total_supply
-                - (pool_bal.value() - pool_xfer.get().asset_amount())
+                - (pool_bal.value() - pool_xfer.get().asset_amount())  # Correctness:  Check for underflow.
             ),
             # Send back commensurate amt of a
             ConstantProductAMM.do_axfer(
@@ -290,6 +291,9 @@ class ConstantProductAMM(Application):
 
     @Subroutine(TealType.uint64)
     def tokens_to_mint_initial(a_amount, b_amount):
+        # Correctness concerns:
+        # * Should the multiplication check for overflow or use 128-bit arithmetic?
+        # * Can the subtraction produce an unintended negative value?
         return Sqrt(a_amount * b_amount) - ConstantProductAMM.scale
 
     @Subroutine(TealType.uint64)
