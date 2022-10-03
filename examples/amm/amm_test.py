@@ -242,6 +242,7 @@ def test_bad_mint(creator_app_client: ApplicationClient):
 
     sp = algod_client.suggested_params()
 
+    # Regression defense:  Is it worthwhile to test all method preconditions rather than _only_ amount invariants?
     try:
         creator_app_client.call(
             ConstantProductAMM.mint,

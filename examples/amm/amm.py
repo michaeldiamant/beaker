@@ -144,7 +144,7 @@ class ConstantProductAMM(Application):
         self,
         a_xfer: abi.AssetTransferTransaction,
         b_xfer: abi.AssetTransferTransaction,
-        pool_asset: abi.Asset = pool_token,
+        pool_asset: abi.Asset = pool_token, # Request for clarification:  How do default values interact with contract.json generation + invocation routing?
         a_asset: abi.Asset = asset_a,
         b_asset: abi.Asset = asset_b,
     ):
@@ -211,7 +211,7 @@ class ConstantProductAMM(Application):
     def burn(
         self,
         pool_xfer: abi.AssetTransferTransaction,
-        pool_asset: abi.Asset = pool_token,
+        pool_asset: abi.Asset = pool_token, # Is it strictly necessary to supply the pool asset when it's already stored in global state?
         a_asset: abi.Asset = asset_a,
         b_asset: abi.Asset = asset_b,
     ):
@@ -300,7 +300,7 @@ class ConstantProductAMM(Application):
             Assert(*valid_swap_xfer),
             in_sup := AssetHolding.balance(self.address, in_id),
             out_sup := AssetHolding.balance(self.address, out_id),
-            Assert(And(in_sup.hasValue(), out_sup.hasValue())),
+            Assert(And(in_sup.hasValue(), out_sup.hasValue())), # Are there tests to ensure correctness at boundaries (e.g. 0 remaining units for 1 asset)?
             self.do_axfer(
                 Txn.sender(),
                 out_id,
