@@ -1,4 +1,13 @@
 .vscode/
 .venv/
 __pycache__/
-beaker.egg-info/
+*.egg-info/
+.coverage
+docs/build/
+dist/*
+.mypy-cache/
+.idea/
+
+# Pyenv
+.python-version
+

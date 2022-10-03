@@ -1,42 +1,33 @@
-import base64
-
 from algosdk.future import transaction
 from algosdk.atomic_transaction_composer import (
     AtomicTransactionComposer,
-    AccountTransactionSigner,
     TransactionWithSigner,
 )
 
-from beaker.sandbox import get_accounts, get_client
+from beaker.sandbox import get_accounts, get_algod_client
 from beaker.client import ApplicationClient
 
 from amm import ConstantProductAMM
 
 
-client = get_client()
+# Take first account from sandbox
+acct = get_accounts().pop()
+addr, sk, signer = acct.address, acct.private_key, acct.signer
 
-addr, sk = get_accounts().pop()
-signer = AccountTransactionSigner(sk)
+# get sandbox client
+client = get_algod_client()
+
+# Create an Application client containing both an algod client and my app
+app_client = ApplicationClient(client, ConstantProductAMM(), signer=acct.signer)
 
 
 def demo():
-
-    # Initialize Application from amm.py
-    app = ConstantProductAMM()
-
-    # Create an Application client containing both an algod client and my app
-    app_client = ApplicationClient(client, app, signer=signer)
 
     # Create the applicatiion on chain, set the app id for the app client
     app_id, app_addr, txid = app_client.create()
     print(f"Created App with id: {app_id} and address addr: {app_addr} in tx: {txid}")
 
     # Fund App address so it can create the pool token and hold balances
-    sp = client.suggested_params()
-    txid = client.send_transaction(
-        transaction.PaymentTxn(addr, sp, app_addr, int(1e7)).sign(sk)
-    )
-    transaction.wait_for_confirmation(client, txid, 4)
 
     # Create assets
     asset_a = create_asset(addr, sk, "A")
@@ -45,7 +36,13 @@ def demo():
 
     # Call app to create pool token
     print("Calling bootstrap")
-    result = app_client.call(app.bootstrap, a_asset=asset_a, b_asset=asset_b)
+    sp = client.suggested_params()
+    ptxn = TransactionWithSigner(
+        txn=transaction.PaymentTxn(addr, sp, app_addr, int(1e7)), signer=signer
+    )
+    result = app_client.call(
+        ConstantProductAMM.bootstrap, seed=ptxn, a_asset=asset_a, b_asset=asset_b
+    )
     pool_token = result.return_value
     print(f"Created pool token with id: {pool_token}")
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
@@ -67,7 +64,7 @@ def demo():
     ###
     print("Funding")
     app_client.call(
-        app.mint,
+        ConstantProductAMM.mint,
         a_xfer=TransactionWithSigner(
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 10000, asset_a),
             signer=signer,
@@ -76,9 +73,6 @@ def demo():
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 3000, asset_b),
             signer=signer,
         ),
-        pool_asset=pool_token,
-        a_asset=asset_a,
-        b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
     ###
@@ -86,7 +80,7 @@ def demo():
     ###
     print("Minting")
     app_client.call(
-        app.mint,
+        ConstantProductAMM.mint,
         a_xfer=TransactionWithSigner(
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 100000, asset_a),
             signer=signer,
@@ -95,9 +89,6 @@ def demo():
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 1000, asset_b),
             signer=signer,
         ),
-        pool_asset=pool_token,
-        a_asset=asset_a,
-        b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
 
@@ -106,13 +97,11 @@ def demo():
     ###
     print("Swapping A for B")
     app_client.call(
-        app.swap,
+        ConstantProductAMM.swap,
         swap_xfer=TransactionWithSigner(
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 500, asset_a),
             signer=signer,
         ),
-        a_asset=asset_a,
-        b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
 
@@ -121,13 +110,11 @@ def demo():
     ###
     print("Swapping B for A")
     app_client.call(
-        app.swap,
+        ConstantProductAMM.swap,
         swap_xfer=TransactionWithSigner(
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 500, asset_b),
             signer=signer,
         ),
-        a_asset=asset_a,
-        b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
 
@@ -136,14 +123,11 @@ def demo():
     ###
     print("Burning")
     app_client.call(
-        app.burn,
+        ConstantProductAMM.burn,
         pool_xfer=TransactionWithSigner(
             txn=transaction.AssetTransferTxn(addr, sp, app_addr, 100, pool_token),
             signer=signer,
         ),
-        pool_asset=pool_token,
-        a_asset=asset_a,
-        b_asset=asset_b,
     )
     print_balances(app_id, app_addr, addr, pool_token, asset_a, asset_b)
 
@@ -185,23 +169,10 @@ def print_balances(app_id: int, app: str, addr: str, pool: int, a: int, b: int):
         if asset["asset-id"] == b:
             print("\tAssetB Balance {}".format(asset["amount"]))
 
-    app_state = client.application_info(app_id)
-    state = {}
-    for sv in app_state["params"]["global-state"]:
-        key = base64.b64decode(sv["key"]).decode("utf-8")
-        match sv["value"]["type"]:
-            case 1:
-                val = f"0x{base64.b64decode(sv['value']['bytes']).hex()}"
-            case 2:
-                val = sv["value"]["uint"]
-            case 3:
-                pass
-        state[key] = val
-
-    if "r" in state:
-        print(
-            f"\tCurrent ratio a/b == {state['r'] / 1000}"
-        )  # TODO: dont hardcode the scale
+    state = app_client.get_application_state()
+    state_key = ConstantProductAMM.ratio.str_key()
+    if state_key in state:
+        print(f"\tCurrent ratio a/b == {state[state_key] / ConstantProductAMM._scale}")
     else:
         print("\tNo ratio a/b")
 

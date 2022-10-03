@@ -1,9 +1,12 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace, astuple
+from enum import Enum
 from functools import wraps
-from inspect import get_annotations, signature, Signature
-from typing import Callable, Final, cast, Any
+from inspect import get_annotations, signature, Parameter
+from typing import Optional, Callable, Final, cast, Any, TypeVar
+from types import FunctionType
 from algosdk.abi import Method
 from pyteal import (
+    abi,
     ABIReturnSubroutine,
     And,
     App,
@@ -21,48 +24,172 @@ from pyteal import (
     TealInputError,
     TealType,
     TealTypeError,
+    Bytes,
     Txn,
 )
 
-from beaker.model import Model
+from beaker.state import AccountStateValue, ApplicationStateValue
 
 HandlerFunc = Callable[..., Expr]
 
 _handler_config_attr: Final[str] = "__handler_config__"
 
 
+CheckExpr = Callable[..., Expr]
+ABIType = TypeVar("ABIType", bound=abi.BaseType)
+
+
+DefaultArgumentType = Expr | FunctionType | int | bytes | str
+
+
+class DefaultArgumentClass(str, Enum):
+    ABIMethod = "abi-method"
+    LocalState = "local-state"
+    GlobalState = "global-state"
+    Constant = "constant"
+
+
+class DefaultArgument:
+    """DefaultArgument is a container for any arguments that may be resolved prior to calling some target method"""
+
+    def __init__(
+        self,
+        resolver: DefaultArgumentType,
+    ):
+        self.resolver = resolver
+
+        match resolver:
+
+            # Expr types
+            case AccountStateValue():
+                self.resolvable_class = DefaultArgumentClass.LocalState
+            case ApplicationStateValue():
+                self.resolvable_class = DefaultArgumentClass.GlobalState
+            case Bytes() | Int():
+                self.resolvable_class = DefaultArgumentClass.Constant
+
+            # Native types
+            case int() | str() | bytes():
+                self.resolvable_class = DefaultArgumentClass.Constant
+
+            # FunctionType
+            case _:
+                # Fall through, if its not got a valid handler config, raise error
+                hc = get_handler_config(cast(HandlerFunc, resolver))
+                if hc.method_spec is None or not hc.read_only:
+                    raise TealTypeError(self.resolver, DefaultArgumentType)
+
+                self.resolvable_class = DefaultArgumentClass.ABIMethod
+
+    def resolve_hint(self):
+        match self.resolver:
+            # Expr types
+            case AccountStateValue() | ApplicationStateValue():
+                return self.resolver.str_key()
+            case Bytes():
+                return self.resolver.byte_str.replace('"', "")
+            case Int():
+                return self.resolver.value
+            # Native types
+            case int() | bytes() | str():
+                return self.resolver
+
+            # FunctionType
+            case _:
+                # Fall through, if its not got a valid handler config, raise error
+                hc = get_handler_config(cast(HandlerFunc, self.resolver))
+                if hc.method_spec is None or not hc.read_only:
+                    raise TealTypeError(self.resolver, DefaultArgumentType)
+
+                return hc.method_spec.dictify()
+
+    def dictify(self) -> dict[str, Any]:
+        return {"source": self.resolvable_class.value, "data": self.resolve_hint()}
+
+
 @dataclass
 class HandlerConfig:
     """HandlerConfig contains all the extra bits of info about a given ABI method"""
 
-    method_spec: Method = field(kw_only=True, default=None)
-    subroutine: Subroutine = field(kw_only=True, default=None)
-    bare_method: BareCallActions = field(kw_only=True, default=None)
+    method_spec: Optional[Method] = field(kw_only=True, default=None)
+    subroutine: Optional[Subroutine] = field(kw_only=True, default=None)
+    bare_method: Optional[BareCallActions] = field(kw_only=True, default=None)
 
     referenced_self: bool = field(kw_only=True, default=False)
-    models: dict[str, Model] = field(kw_only=True, default=None)
+    structs: Optional[dict[str, abi.NamedTuple]] = field(kw_only=True, default=None)
 
-    resolvable: "ResolvableArguments" = field(kw_only=True, default=None)
-    method_config: MethodConfig = field(kw_only=True, default=None)
+    default_arguments: Optional[dict[str, DefaultArgument]] = field(
+        kw_only=True, default=None
+    )
+
+    method_config: Optional[MethodConfig] = field(kw_only=True, default=None)
     read_only: bool = field(kw_only=True, default=False)
 
     def hints(self) -> "MethodHints":
-        mh = MethodHints(read_only=self.read_only)
+        mh: dict[str, Any] = {"read_only": self.read_only}
 
-        if self.resolvable is not None:
-            resolvable = {}
-            for arg_name, ra in self.resolvable.__dict__.items():
-                hc = get_handler_config(ra)
-                resolvable[arg_name] = hc.method_spec
-            mh.resolvable = resolvable
+        if (
+            self.default_arguments is not None
+            and len(self.default_arguments.keys()) > 0
+        ):
+            mh["default_arguments"] = self.default_arguments
 
-        if self.models is not None:
-            models = {}
-            for arg_name, model_spec in self.models.items():
-                models[arg_name] = list(model_spec.__annotations__.keys())
-            mh.models = models
+        if self.structs is not None:
+            structs: dict[str, dict[str, str | list[tuple[str, str]]]] = {}
+            for arg_name, model_spec in self.structs.items():
+                annos: list[tuple[str, Any]] = list(model_spec.__annotations__.items())
+                structs[arg_name] = {
+                    "name": str(model_spec.__name__),  # type: ignore[attr-defined]
+                    "elements": [
+                        (name, str(abi.algosdk_from_annotation(typ.__args__[0])))
+                        for name, typ in annos
+                    ],
+                }
 
-        return mh
+            mh["structs"] = structs
+
+        return MethodHints(**mh)
+
+    def is_create(self) -> bool:
+        if self.method_config is None:
+            return False
+
+        return any(
+            map(
+                lambda cc: cc == CallConfig.CREATE or cc == CallConfig.ALL,
+                astuple(self.method_config),
+            )
+        )
+
+    def is_update(self) -> bool:
+        return (
+            self.method_config is not None
+            and self.method_config.update_application != CallConfig.NEVER
+        )
+
+    def is_delete(self) -> bool:
+        return (
+            self.method_config is not None
+            and self.method_config.delete_application != CallConfig.NEVER
+        )
+
+    def is_opt_in(self) -> bool:
+        return (
+            self.method_config is not None
+            and self.method_config.opt_in != CallConfig.NEVER
+        )
+
+    def is_clear_state(self) -> bool:
+        return (
+            self.method_config is not None
+            and self.method_config.clear_state != CallConfig.NEVER
+        )
+
+    def is_close_out(self) -> bool:
+        return (
+            self.method_config is not None
+            and self.method_config.close_out != CallConfig.NEVER
+        )
 
 
 def get_handler_config(fn: HandlerFunc) -> HandlerConfig:
@@ -78,47 +205,37 @@ def set_handler_config(fn: HandlerFunc, **kwargs):
 
 @dataclass
 class MethodHints:
-    """MethodHints provides some hints to the caller"""
+    """MethodHints provides hints to the caller about how to call the method"""
 
-    resolvable: dict[str, Method] = field(kw_only=True, default=None)
+    #: hint to indicate this method can be called through Dryrun
     read_only: bool = field(kw_only=True, default=False)
-    models: dict[str, list[str]] = field(kw_only=True, default=None)
+    #: hint to provide names for tuple argument indices method_name=>param_name=>{name:str, elements:[str,str]}
+    structs: Optional[dict[str, dict[str, str | list[tuple[str, str]]]]] = field(
+        kw_only=True, default=None
+    )
+    #: defaults
+    default_arguments: Optional[dict[str, DefaultArgument]] = field(
+        kw_only=True, default=None
+    )
+
+    def empty(self) -> bool:
+        return (
+            self.structs is None
+            and self.default_arguments is None
+            and not self.read_only
+        )
 
     def dictify(self) -> dict[str, Any]:
-        d = {"resolvable": {}, "read_only": self.read_only, "models": self.models}
-
-        if self.resolvable is not None:
-            d["resolvable"] = {k: v.dictify() for k, v in self.resolvable.items()}
-
+        d: dict[str, Any] = {}
+        if self.read_only:
+            d["read_only"] = True
+        if self.default_arguments is not None:
+            d["default_arguments"] = {
+                k: v.dictify() for k, v in self.default_arguments.items()
+            }
+        if self.structs is not None:
+            d["structs"] = self.structs
         return d
-
-
-class ResolvableArguments:
-    """ResolvableArguments is a container for any arguments that may be resolved prior to calling some target method"""
-
-    def __init__(
-        self,
-        **kwargs: dict[str, ABIReturnSubroutine | HandlerFunc],
-    ):
-
-        resolvable_args = {}
-        for arg_name, arg_resolver in kwargs.items():
-            if not isinstance(arg_resolver, ABIReturnSubroutine):
-                # Assume its a handler func and try to get the config
-                hc = get_handler_config(arg_resolver)
-                if hc.method_spec is None:
-                    raise TealTypeError(arg_resolver, ABIReturnSubroutine)
-
-            resolvable_args[arg_name] = arg_resolver
-
-        self.__dict__.update(**resolvable_args)
-
-    def check_arguments(self, sig: Signature):
-        for k in self.__dict__.keys():
-            if k not in sig.parameters:
-                raise Exception(
-                    f"The ResolvableArgument field {k} not present in function signature"
-                )
 
 
 class Authorize:
@@ -126,20 +243,20 @@ class Authorize:
 
     @staticmethod
     def only(addr: Expr):
-        """only requires that the sender of the app call being evaluated match exactly the address passed"""
+        """require that the sender of the app call match exactly the address passed"""
 
         if addr.type_of() != TealType.bytes:
             raise TealTypeError(addr.type_of(), TealType.bytes)
 
         @Subroutine(TealType.uint64, name="auth_only")
-        def _impl(sender: Expr):
+        def _impl(sender: Expr) -> Expr:
             return sender == addr
 
         return _impl
 
     @staticmethod
     def holds_token(asset_id: Expr):
-        """holds_token ensures that the sender of the app call being evaluated holds >0 of the asset id passed"""
+        """require that the sender of the app call holds >0 of the asset id passed"""
 
         if asset_id.type_of() != TealType.uint64:
             raise TealTypeError(asset_id.type_of(), TealType.uint64)
@@ -155,7 +272,7 @@ class Authorize:
 
     @staticmethod
     def opted_in(app_id: Expr):
-        """opted_in ensures that the sender of the app call being evaluated has already opted-in to a given app id"""
+        """require that the sender of the app call has already opted-in to a given app id"""
 
         if app_id.type_of() != TealType.uint64:
             raise TealTypeError(app_id.type_of(), TealType.uint64)
@@ -167,7 +284,7 @@ class Authorize:
         return _impl
 
 
-def _authorize(allowed: SubroutineFnWrapper):
+def _authorize(allowed: SubroutineFnWrapper) -> Callable[..., HandlerFunc]:
     args = allowed.subroutine.expected_arg_types
 
     if len(args) != 1 or args[0] is not Expr:
@@ -178,30 +295,33 @@ def _authorize(allowed: SubroutineFnWrapper):
     if allowed.type_of() != TealType.uint64:
         raise TealTypeError(allowed.type_of(), TealType.uint64)
 
-    def _decorate(fn: HandlerFunc):
+    def _decorate(fn: HandlerFunc) -> HandlerFunc:
         @wraps(fn)
-        def _impl(*args, **kwargs):
-            return Seq(Assert(allowed(Txn.sender())), fn(*args, **kwargs))
+        def _impl(*args, **kwargs) -> Expr:
+            return Seq(
+                Assert(allowed(Txn.sender()), comment="unauthorized"),
+                fn(*args, **kwargs),
+            )
 
         return _impl
 
     return _decorate
 
 
-def _readonly(fn: HandlerFunc):
+def _readonly(fn: HandlerFunc) -> HandlerFunc:
     set_handler_config(fn, read_only=True)
     return fn
 
 
-def _on_complete(mc: MethodConfig):
-    def _impl(fn: HandlerFunc):
+def _on_complete(mc: MethodConfig) -> Callable[..., HandlerFunc]:
+    def _impl(fn: HandlerFunc) -> HandlerFunc:
         set_handler_config(fn, method_config=mc)
         return fn
 
     return _impl
 
 
-def _replace_models(fn: HandlerFunc) -> HandlerFunc:
+def _replace_structs(fn: HandlerFunc) -> HandlerFunc:
     sig = signature(fn)
     params = sig.parameters.copy()
 
@@ -210,20 +330,43 @@ def _replace_models(fn: HandlerFunc) -> HandlerFunc:
     for k, v in params.items():
         cls = v.annotation
         if hasattr(v.annotation, "__origin__"):
-            # Generic type, not a Model
+            # Generic type, not a Struct
             continue
 
-        if issubclass(cls, Model):
-            params[k] = v.replace(annotation=cls().get_type())
-            annotations[k] = cls().get_type()
+        if issubclass(cls, abi.NamedTuple):
+            params[k] = v.replace(annotation=cls().type_spec().annotation_type())
+            annotations[k] = cls().type_spec().annotation_type()
             replaced[k] = cls
 
     if len(replaced.keys()) > 0:
-        set_handler_config(fn, models=replaced)
+        set_handler_config(fn, structs=replaced)
 
-    newsig = sig.replace(parameters=params.values())
-    fn.__signature__ = newsig
+    newsig = sig.replace(parameters=list(params.values()))
+    fn.__signature__ = newsig  # type: ignore[attr-defined]
     fn.__annotations__ = annotations
+
+    return fn
+
+
+def _capture_defaults(fn: HandlerFunc) -> HandlerFunc:
+    sig = signature(fn)
+    params = sig.parameters.copy()
+
+    default_args: dict[str, DefaultArgument] = {}
+
+    for k, v in params.items():
+        match v.default:
+            case Expr() | int() | str() | bytes() | FunctionType():
+                default_args[k] = DefaultArgument(v.default)
+                params[k] = v.replace(default=Parameter.empty)
+
+    if len(default_args.items()) > 0:
+        # Update handler config
+        set_handler_config(fn, default_arguments=default_args)
+
+        # Fix function sig/annotations
+        newsig = sig.replace(parameters=list(params.values()))
+        fn.__signature__ = newsig  # type: ignore[attr-defined]
 
     return fn
 
@@ -236,56 +379,79 @@ def _remove_self(fn: HandlerFunc) -> HandlerFunc:
         del params["self"]
         # Flag that this method did have a `self` argument
         set_handler_config(fn, referenced_self=True)
-    newsig = sig.replace(parameters=params.values())
-    fn.__signature__ = newsig
+    newsig = sig.replace(parameters=list(params.values()))
+    fn.__signature__ = newsig  # type: ignore[attr-defined]
 
     return fn
 
 
-def internal(return_type: TealType):
-    """internal can be used to wrap a subroutine that is defined inside an application class"""
+def internal(return_type_or_handler: TealType | HandlerFunc):
+    """creates a subroutine to be called by logic internally
+
+    Args:
+        return_type: The type this method's returned Expression should evaluate to
+    Returns:
+        The wrapped subroutine
+    """
+
+    fn: Optional[HandlerFunc] = None
+    return_type: Optional[TealType] = None
+
+    if type(return_type_or_handler) is TealType:
+        return_type = return_type_or_handler
+    else:
+        fn = cast(HandlerFunc, return_type_or_handler)
 
     def _impl(fn: HandlerFunc):
-        hc = get_handler_config(fn)
 
-        hc.subroutine = Subroutine(return_type, name=fn.__name__)
-        if "self" in signature(fn).parameters:
-            hc.referenced_self = True
+        if return_type is not None:
+            set_handler_config(fn, subroutine=Subroutine(return_type, name=fn.__name__))
 
-        set_handler_config(fn, **hc.__dict__)
+            # Don't remove self for subroutine, it fails later on in pyteal
+            # during call to _validate  with invalid signature
+            sig = signature(fn)
+            if "self" in sig.parameters:
+                set_handler_config(fn, referenced_self=True)
+
+        else:
+            fn = _remove_self(fn)
+            set_handler_config(fn, method_spec=ABIReturnSubroutine(fn).method_spec())
+
         return fn
+
+    if fn is not None:
+        return _impl(fn)
 
     return _impl
 
 
-def handler(
+def external(
     fn: HandlerFunc = None,
     /,
     *,
     authorize: SubroutineFnWrapper = None,
     method_config: MethodConfig = None,
     read_only: bool = False,
-    resolvable: ResolvableArguments = None,
-):
+) -> HandlerFunc:
+
     """
-    handler is the primary way to expose an ABI method for an application
-    it may take a number of arguments:
+    Add the method decorated to be handled as an ABI method for the Application
 
     Args:
+        fn: The function being wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+        method_config:  A subroutine that should take a single argument (Txn.sender()) and evaluate to 1/0 depending on the app call transaction sender.
+        read_only: Mark a method as callable with no fee using dryrun or simulate
 
-        authorize: A subroutine that should take a single argument (Txn.sender()) and evaluate to 1/0 depending on the app call transaction sender
-        method_config: accepts a MethodConfig object to define how the app call should be routed given OnComplete and whether or not the call is a create
-        read_only: adds `read-only` flag to abi (eventually, currently it does nothing)
-        resolvable: provides hints to a caller at how to resolve some arguments
+    Returns:
+        The original method with additional elements set in its  :code:`__handler_config__` attribute
     """
 
     def _impl(fn: HandlerFunc):
         fn = _remove_self(fn)
-        fn = _replace_models(fn)
+        fn = _capture_defaults(fn)
+        fn = _replace_structs(fn)
 
-        if resolvable is not None:
-            resolvable.check_arguments(signature(fn))
-            set_handler_config(fn, resolvable=resolvable)
         if authorize is not None:
             fn = _authorize(authorize)(fn)
         if method_config is not None:
@@ -303,40 +469,55 @@ def handler(
     return _impl(fn)
 
 
-def bare_handler(
+def bare_external(
     no_op: CallConfig = None,
     opt_in: CallConfig = None,
     clear_state: CallConfig = None,
     delete_application: CallConfig = None,
     update_application: CallConfig = None,
     close_out: CallConfig = None,
-):
-    def _impl(fun: HandlerFunc) -> OnCompleteAction:
+) -> Callable[..., HandlerFunc]:
+    """Add method to be handled by specific bare :code:`OnComplete` actions.
+
+    Args:
+        no_op: CallConfig to handle a `NoOp`
+        opt_in: CallConfig to handle an `OptIn`
+        clear_state: CallConfig to handle a `ClearState`
+        delete_application: CallConfig to handle a `DeleteApplication`
+        update_application: CallConfig to handle a `UpdateApplication`
+        close_out: CallConfig to handle a `CloseOut`
+
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+
+    """
+
+    def _impl(fun: HandlerFunc) -> HandlerFunc:
         fun = _remove_self(fun)
         fn = Subroutine(TealType.none)(fun)
         bca = BareCallActions(
             no_op=OnCompleteAction(action=fn, call_config=no_op)
             if no_op is not None
-            else None,
+            else OnCompleteAction.never(),
             delete_application=OnCompleteAction(
                 action=fn, call_config=delete_application
             )
             if delete_application is not None
-            else None,
+            else OnCompleteAction.never(),
             update_application=OnCompleteAction(
                 action=fn, call_config=update_application
             )
             if update_application is not None
-            else None,
+            else OnCompleteAction.never(),
             opt_in=OnCompleteAction(action=fn, call_config=opt_in)
             if opt_in is not None
-            else None,
+            else OnCompleteAction.never(),
             close_out=OnCompleteAction(action=fn, call_config=close_out)
             if close_out is not None
-            else None,
+            else OnCompleteAction.never(),
             clear_state=OnCompleteAction(action=fn, call_config=clear_state)
             if clear_state is not None
-            else None,
+            else OnCompleteAction.never(),
         )
 
         set_handler_config(fun, bare_method=bca)
@@ -346,33 +527,213 @@ def bare_handler(
     return _impl
 
 
-class Bare:
-    """Bare contains static methods for handling bare application calls, that is app calls with no arguments"""
+def is_bare(fn: HandlerFunc) -> bool:
+    sig = signature(fn)
+    return len(sig.parameters) == 0 or (
+        len(sig.parameters) == 1 and "self" in sig.parameters
+    )
 
-    @staticmethod
-    def create(fn: HandlerFunc):
-        return bare_handler(no_op=CallConfig.CREATE)(fn)
 
-    @staticmethod
-    def delete(fn: HandlerFunc):
-        return bare_handler(delete_application=CallConfig.CALL)(fn)
+def create(
+    fn: HandlerFunc = None,
+    /,
+    *,
+    authorize: SubroutineFnWrapper = None,
+    method_config: Optional[MethodConfig] = None,
+):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`NoOp` call and ApplicationId == 0
 
-    @staticmethod
-    def update(fn: HandlerFunc):
-        return bare_handler(update_application=CallConfig.CALL)(fn)
+    Args:
+        fn: The method to be wrapped.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
 
-    @staticmethod
-    def opt_in(fn: HandlerFunc):
-        return bare_handler(opt_in=CallConfig.CALL)(fn)
+    mconfig = (
+        {"no_op": CallConfig.CREATE} if method_config is None else asdict(method_config)
+    )
 
-    @staticmethod
-    def clear_state(fn: HandlerFunc):
-        return bare_handler(clear_state=CallConfig.CALL)(fn)
+    if not all(
+        [cc == CallConfig.CREATE or cc == CallConfig.ALL for cc in mconfig.values()]
+    ):
+        raise TealInputError(
+            "method_config for create may not have non create call configs"
+        )
 
-    @staticmethod
-    def close_out(fn: HandlerFunc):
-        return bare_handler(close_out=CallConfig.CALL)(fn)
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(**mconfig)(fn)
+        else:
+            return external(method_config=MethodConfig(**mconfig), authorize=authorize)(
+                fn
+            )
 
-    @staticmethod
-    def no_op(fn: HandlerFunc):
-        return bare_handler(no_op=CallConfig.CALL)(fn)
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def delete(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`DeleteApplication` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(delete_application=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(delete_application=CallConfig.CALL),
+                authorize=authorize,
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def update(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`UpdateApplication` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    # If fn has abi args, call external
+    # else bare
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(update_application=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(update_application=CallConfig.CALL),
+                authorize=authorize,
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def opt_in(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`OptIn` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(opt_in=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(opt_in=CallConfig.CALL), authorize=authorize
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def clear_state(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`ClearState` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(clear_state=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(clear_state=CallConfig.CALL),
+                authorize=authorize,
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def close_out(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`CloseOut` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(close_out=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(close_out=CallConfig.CALL),
+                authorize=authorize,
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
+
+
+def no_op(fn: HandlerFunc = None, /, *, authorize: SubroutineFnWrapper = None):
+    """set method to be handled by an application call with its :code:`OnComplete` set to :code:`NoOp` call
+
+    Args:
+        fn: The method to be wrapped.
+        authorize: a subroutine with input of ``Txn.sender()`` and output uint64 interpreted as allowed if the output>0.
+    Returns:
+        The original method with changes made to its signature and attributes set in its `__handler_config__`
+    """
+
+    def _impl(fn: HandlerFunc):
+        if is_bare(fn):
+            if authorize is not None:
+                fn = _authorize(authorize)(fn)
+            return bare_external(no_op=CallConfig.CALL)(fn)
+        else:
+            return external(
+                method_config=MethodConfig(no_op=CallConfig.CALL), authorize=authorize
+            )(fn)
+
+    if fn is None:
+        return _impl
+
+    return _impl(fn)
