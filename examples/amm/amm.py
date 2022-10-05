@@ -139,7 +139,7 @@ class ConstantProductAMM(Application):
     # AMM specific methods for mint/burn/swap
     ##############
 
-    @external # Request for clarification:  As shown, what on-completes are restricted?  Does the actual behavior match the desired behavior?
+    @external
     def mint(
         self,
         a_xfer: abi.AssetTransferTransaction,
