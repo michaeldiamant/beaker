@@ -145,6 +145,7 @@ class ConstantProductAMM(Application):
         a_xfer: abi.AssetTransferTransaction,
         b_xfer: abi.AssetTransferTransaction,
         pool_asset: abi.Asset = pool_token, # Request for clarification:  How do default values interact with contract.json generation + invocation routing?
+            # After more reading, I understand it's to benefit clients when building transactions.  Seems https://github.com/algorand/go-algorand/issues/4391 ameliorates the concern and may allow removal of client-only parameters.
         a_asset: abi.Asset = asset_a,
         b_asset: abi.Asset = asset_b,
     ):
@@ -196,7 +197,7 @@ class ConstantProductAMM(Application):
                     ),
                     # Normal mint
                     self.tokens_to_mint(
-                        self.total_supply - pool_bal.value(), # Is it safe to omit underflow check?
+                        self.total_supply - pool_bal.value(),
                         a_bal.value() - a_xfer.get().asset_amount(),
                         b_bal.value() - b_xfer.get().asset_amount(),
                         a_xfer.get().asset_amount(),
@@ -212,6 +213,7 @@ class ConstantProductAMM(Application):
         self,
         pool_xfer: abi.AssetTransferTransaction,
         pool_asset: abi.Asset = pool_token, # Is it strictly necessary to supply the pool asset when it's already stored in global state?
+            # I've answered my own question.  See "How do default values".
         a_asset: abi.Asset = asset_a,
         b_asset: abi.Asset = asset_b,
     ):
@@ -239,7 +241,7 @@ class ConstantProductAMM(Application):
             Assert(And(pool_bal.hasValue(), a_bal.hasValue(), b_bal.hasValue())),
             # Get the total number of tokens issued (prior to receiving the current axfer of pool tokens)
             (issued := ScratchVar()).store(
-                self.total_supply - (pool_bal.value() - pool_xfer.get().asset_amount()) # Correctness:  Check for underflow.
+                self.total_supply - (pool_bal.value() - pool_xfer.get().asset_amount())
             ),
             # Send back commensurate amt of a
             self.do_axfer(
@@ -334,18 +336,19 @@ class ConstantProductAMM(Application):
 
     @internal(TealType.uint64)
     def tokens_to_mint_initial(self, a_amount, b_amount):
-        return Sqrt(a_amount * b_amount) - self.scale
+        return Sqrt(a_amount * b_amount) - self.scale # Correctness concerns:  Add test proving a_amount * b_amount > 64 bits is supported?
 
     @internal(TealType.uint64)
     def tokens_to_burn(self, issued, supply, amount):
-        return WideRatio([supply, amount], [issued])
+        return WideRatio([supply, amount], [issued]) # Sanity check: What ought to happen to fractional amounts rounded off?  Asked another way, is `amount` the ceiling or floor?
+    # Based on tests, it looks it's intended to be ceiling.
 
     @internal(TealType.uint64)
     def tokens_to_swap(self, in_amount, in_supply, out_supply):
         factor = self.scale - self.fee
         return WideRatio(
             [in_amount, factor, out_supply],
-            [(in_supply * self.scale) + (in_amount * factor)],
+            [(in_supply * self.scale) + (in_amount * factor)], # Correctness:  Should the multiplication and addition here support 128-bit values?
         )
 
     ##############
@@ -354,6 +357,7 @@ class ConstantProductAMM(Application):
 
     @internal(TealType.none)
     def do_axfer(self, rx, aid, amt):
+        # Request for clarification:  For inner transactions, who is intended to pay the fees (app or caller)?  If caller, then setting fee == 0 enforces the behavior.
         return InnerTxnBuilder.Execute(
             {
                 TxnField.type_enum: TxnType.AssetTransfer,
